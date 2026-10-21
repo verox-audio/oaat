@@ -948,7 +948,7 @@ dependencies = [
 
 [[package]]
 name = "oaat-cli"
-version = "0.2.6"
+version = "0.2.8"
 dependencies = [
  "clap",
  "hostname",
@@ -967,7 +967,7 @@ dependencies = [
 
 [[package]]
 name = "oaat-controller"
-version = "0.2.6"
+version = "0.2.8"
 dependencies = [
  "bytes",
  "hostname",
@@ -985,7 +985,7 @@ dependencies = [
 
 [[package]]
 name = "oaat-core"
-version = "0.2.6"
+version = "0.2.8"
 dependencies = [
  "bitflags 2.13.2",
  "bytes",
@@ -1001,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "oaat-endpoint"
-version = "0.2.6"
+version = "0.2.8"
 dependencies = [
  "alsa",
  "bytes",
@@ -1022,12 +1022,13 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
 [[package]]
 name = "oaat-ffi"
-version = "0.2.6"
+version = "0.2.8"
 dependencies = [
  "oaat-core",
  "oaat-endpoint",
@@ -1038,7 +1039,7 @@ dependencies = [
 
 [[package]]
 name = "oaat-test"
-version = "0.2.6"
+version = "0.2.8"
 dependencies = [
  "clap",
  "oaat-controller",
@@ -1050,7 +1051,7 @@ dependencies = [
 
 [[package]]
 name = "oaat-tests"
-version = "0.2.6"
+version = "0.2.8"
 dependencies = [
  "oaat-controller",
  "oaat-core",
