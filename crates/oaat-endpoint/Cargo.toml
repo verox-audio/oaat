@@ -27,6 +27,9 @@ rustls = { workspace = true, optional = true }
 hyper = { version = "1", features = ["http1", "server"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 http-body-util = { version = "0.1", optional = true }
+# Announce through the system's Avahi daemon over D-Bus (feature mdns-avahi).
+zbus = { version = "5", default-features = false, features = ["tokio"], optional = true }
+futures-util = { version = "0.3", default-features = false, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
@@ -38,6 +41,9 @@ default = ["audio-output", "flac", "tls", "web-ui"]
 audio-output = ["dep:cpal", "dep:ringbuf"]
 flac = ["dep:symphonia"]
 tls = ["dep:tokio-rustls", "dep:rustls", "oaat-core/tls"]
+# Announce through Avahi (D-Bus) instead of the built-in mDNS responder, for
+# systems where avahi-daemon already owns mDNS (Linux distributions).
+mdns-avahi = ["dep:zbus", "dep:futures-util"]
 web-ui = ["dep:hyper", "dep:hyper-util", "dep:http-body-util"]
 
 [dev-dependencies]

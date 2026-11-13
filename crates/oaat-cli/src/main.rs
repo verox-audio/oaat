@@ -13,7 +13,7 @@ use oaat_core::message::{
     EndpointCapabilities, FormatAccept, FormatReject, TrackMetadata, VolumeCapability, VolumeType,
 };
 use oaat_core::wire::PacketFlags;
-use oaat_endpoint::discovery::EndpointAnnouncement;
+use oaat_endpoint::discovery::{Announcer, EndpointAnnouncement};
 use oaat_endpoint::sync::{PtsTracker, SharedClock};
 use oaat_endpoint::transport::{PlaybackCommand, VolumeCommand};
 #[cfg(target_os = "linux")]
@@ -488,7 +488,6 @@ async fn run_endpoint(
     let control_addr: SocketAddr = format!("0.0.0.0:{actual_port}").parse().unwrap();
 
     // Register mDNS
-    let mdns = mdns_sd::ServiceDaemon::new().expect("failed to create mDNS daemon");
     let announcement = EndpointAnnouncement {
         instance_name: name.clone(),
         port: actual_port,
@@ -500,9 +499,13 @@ async fn run_endpoint(
         vendor: Some("MozAIk Labs".into()),
         firmware: Some(env!("CARGO_PKG_VERSION").into()),
     };
-    if let Err(e) = announcement.register(&mdns) {
-        warn!(error = %e, "mDNS registration failed, continuing without discovery");
-    }
+    let mdns = match Announcer::start(announcement) {
+        Ok(announcer) => Some(announcer),
+        Err(e) => {
+            warn!(error = %e, "mDNS registration failed, continuing without discovery");
+            None
+        }
+    };
 
     // Start web UI
     // Release requests (POST /api/release): give up the audio output.
@@ -1364,14 +1367,18 @@ async fn run_endpoint(
             _ = &mut sigint => {
                 info!("Tune Bridge shutting down gracefully");
                 audio.stop();
-                let _ = mdns.shutdown();
+                if let Some(mdns) = mdns {
+                    mdns.shutdown();
+                }
                 remove_pid_file();
                 break;
             }
             _ = sigterm.recv() => {
                 info!("Tune Bridge shutting down gracefully (SIGTERM)");
                 audio.stop();
-                let _ = mdns.shutdown();
+                if let Some(mdns) = mdns {
+                    mdns.shutdown();
+                }
                 remove_pid_file();
                 break;
             }

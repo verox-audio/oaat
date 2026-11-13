@@ -28,6 +28,7 @@ hostname = { workspace = true }
 [features]
 default = ["web-ui"]
 web-ui = ["oaat-endpoint/web-ui"]
+mdns-avahi = ["oaat-endpoint/mdns-avahi"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

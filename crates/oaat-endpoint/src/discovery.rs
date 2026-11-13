@@ -37,6 +37,32 @@ impl EndpointAnnouncement {
         DEFAULT_CONTROL_PORT
     }
 
+    /// TXT properties of the announcement. `ip` is only included when given:
+    /// it tells the controller which address to use, so it has to be current.
+    pub fn txt_properties(&self, ip: Option<&str>) -> Vec<(String, String)> {
+        let mut props = vec![
+            ("v".to_string(), PROTOCOL_VERSION.to_string()),
+            ("id".to_string(), self.endpoint_id.clone()),
+            ("name".to_string(), self.instance_name.clone()),
+            ("caps".to_string(), self.capabilities.to_string()),
+            ("ch".to_string(), self.channels_max.to_string()),
+        ];
+        if let Some(ip) = ip {
+            props.push(("ip".to_string(), ip.to_string()));
+        }
+        for (key, value) in [
+            ("vol", &self.volume_type),
+            ("model", &self.model),
+            ("vendor", &self.vendor),
+            ("fw", &self.firmware),
+        ] {
+            if let Some(value) = value {
+                props.push((key.to_string(), value.clone()));
+            }
+        }
+        props
+    }
+
     pub fn register(&self, mdns: &ServiceDaemon) -> Result<(), mdns_sd::Error> {
         let service_type = format!("{}.local.", SERVICE_TYPE);
         let hostname = format!(
@@ -44,32 +70,13 @@ impl EndpointAnnouncement {
             hostname::get().unwrap_or_default().to_string_lossy()
         );
 
-        let v_str = PROTOCOL_VERSION.to_string();
-        let caps_str = self.capabilities.to_string();
-        let ch_str = self.channels_max.to_string();
         let local_ip = detect_local_ip();
         let ip_str = local_ip.to_string();
-
-        let mut props: Vec<(&str, &str)> = vec![
-            ("v", &v_str),
-            ("id", &self.endpoint_id),
-            ("name", &self.instance_name),
-            ("caps", &caps_str),
-            ("ch", &ch_str),
-            ("ip", &ip_str),
-        ];
-        if let Some(ref vol) = self.volume_type {
-            props.push(("vol", vol));
-        }
-        if let Some(ref model) = self.model {
-            props.push(("model", model));
-        }
-        if let Some(ref vendor) = self.vendor {
-            props.push(("vendor", vendor));
-        }
-        if let Some(ref fw) = self.firmware {
-            props.push(("fw", fw));
-        }
+        let owned = self.txt_properties(Some(&ip_str));
+        let props: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         let service = ServiceInfo::new(
             &service_type,
@@ -89,5 +96,45 @@ impl EndpointAnnouncement {
             "mDNS service registered"
         );
         Ok(())
+    }
+}
+
+/// Keeps the endpoint announced on the network until `shutdown`.
+pub enum Announcer {
+    /// The built-in mDNS responder (mdns-sd).
+    MdnsSd(ServiceDaemon),
+    /// The system's Avahi daemon, over D-Bus.
+    #[cfg(feature = "mdns-avahi")]
+    Avahi(crate::avahi::AvahiAnnouncer),
+}
+
+impl Announcer {
+    /// Announces through Avahi when built with `mdns-avahi`, otherwise with
+    /// the built-in responder. Avahi mode never starts the built-in responder:
+    /// two mDNS stacks on one host make mDNS unreliable. If Avahi isn't
+    /// reachable yet, it keeps retrying in the background.
+    pub fn start(announcement: EndpointAnnouncement) -> Result<Self, mdns_sd::Error> {
+        #[cfg(feature = "mdns-avahi")]
+        {
+            Ok(Announcer::Avahi(crate::avahi::AvahiAnnouncer::start(
+                announcement,
+            )))
+        }
+        #[cfg(not(feature = "mdns-avahi"))]
+        {
+            let mdns = ServiceDaemon::new()?;
+            announcement.register(&mdns)?;
+            Ok(Announcer::MdnsSd(mdns))
+        }
+    }
+
+    pub fn shutdown(self) {
+        match self {
+            Announcer::MdnsSd(mdns) => {
+                let _ = mdns.shutdown();
+            }
+            #[cfg(feature = "mdns-avahi")]
+            Announcer::Avahi(avahi) => avahi.shutdown(),
+        }
     }
 }

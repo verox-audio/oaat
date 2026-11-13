@@ -4,6 +4,8 @@ pub mod alsa_direct;
 pub mod alsa_mixer;
 #[cfg(feature = "audio-output")]
 pub mod audio_output;
+#[cfg(feature = "mdns-avahi")]
+pub mod avahi;
 pub mod discovery;
 #[cfg(feature = "flac")]
 pub mod flac_decoder;
