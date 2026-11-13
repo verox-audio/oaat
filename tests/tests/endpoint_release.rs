@@ -8,11 +8,15 @@ use tokio::sync::mpsc;
 
 use oaat_controller::{ConnectedEndpoint, ControllerConfig, EndpointResponse, Zone};
 use oaat_core::Message;
-use oaat_core::format::AudioFormat;
+use oaat_core::format::{AudioFormat, ChannelLayout};
 use oaat_core::message::{
-    EndpointCapabilities, EndpointRelease, FEATURE_ENDPOINT_RELEASE, ReleaseReason, StreamStats,
+    EndpointCapabilities, EndpointRelease, FEATURE_ENDPOINT_RELEASE, RELEASE_REJECT_REASON,
+    ReleaseReason, StreamStats,
 };
 use oaat_endpoint::{EndpointConfig, EndpointEvent, EndpointTransport};
+
+const ACCEPT_TIMEOUT: Duration = Duration::from_millis(300);
+const RELEASE_ACCEPT_TIMEOUT: Duration = Duration::from_millis(1000);
 
 fn capabilities() -> EndpointCapabilities {
     EndpointCapabilities {
@@ -27,10 +31,46 @@ fn capabilities() -> EndpointCapabilities {
     }
 }
 
+/// An endpoint transport plus a controller connected to it with `features`.
+/// Returns the endpoint's application channel (the side that sends the
+/// release) and the controller.
+async fn connect(features: Vec<String>) -> (mpsc::Sender<Message>, ConnectedEndpoint) {
+    let (ctrl_tx, endpoint, mut event_rx) = connect_with_events(features, false).await;
+    // keep the event channel open for the transport
+    tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+    (ctrl_tx, endpoint)
+}
+
+/// Like `connect`, but the application also gets the endpoint's events, and
+/// `defer_format_accept` is configurable. The fail-open delays are short:
+/// `ACCEPT_TIMEOUT`, `RELEASE_ACCEPT_TIMEOUT`.
+async fn connect_with_events(
+    features: Vec<String>,
+    defer_format_accept: bool,
+) -> (
+    mpsc::Sender<Message>,
+    ConnectedEndpoint,
+    mpsc::Receiver<EndpointEvent>,
+) {
+    let (ctrl_tx, control_addr, mut event_rx) =
+        spawn_endpoint("release-ep", defer_format_accept).await;
+    let endpoint = ConnectedEndpoint::connect(&controller_config(features), control_addr)
+        .await
+        .unwrap();
+    assert!(matches!(
+        event_rx.recv().await,
+        Some(EndpointEvent::Connected { .. })
+    ));
+
+    (ctrl_tx, endpoint, event_rx)
+}
+
 /// An endpoint transport. Returns its application channel (the side that
-/// sends the release), its control address and its event channel.
+/// sends the release), its control address and its event channel. The
+/// fail-open delays are short: `ACCEPT_TIMEOUT`, `RELEASE_ACCEPT_TIMEOUT`.
 async fn spawn_endpoint(
     endpoint_id: &str,
+    defer_format_accept: bool,
 ) -> (mpsc::Sender<Message>, SocketAddr, mpsc::Receiver<EndpointEvent>) {
     let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let control_addr = tcp.local_addr().unwrap();
@@ -45,7 +85,9 @@ async fn spawn_endpoint(
         capabilities: capabilities(),
         buffer_size_ms: 1000,
         tls: false,
-        defer_format_accept: false,
+        defer_format_accept,
+        accept_timeout: ACCEPT_TIMEOUT,
+        release_accept_timeout: RELEASE_ACCEPT_TIMEOUT,
     };
     let (event_tx, event_rx) = mpsc::channel(64);
     let (ctrl_tx, ctrl_rx) = mpsc::channel(32);
@@ -66,23 +108,6 @@ fn controller_config(features: Vec<String>) -> ControllerConfig {
         clock_port: 9742,
         tls: false,
     }
-}
-
-/// An endpoint transport plus a controller connected to it with `features`.
-/// Returns the endpoint's application channel and the controller.
-async fn connect(features: Vec<String>) -> (mpsc::Sender<Message>, ConnectedEndpoint) {
-    let (ctrl_tx, control_addr, mut event_rx) = spawn_endpoint("release-ep").await;
-    let endpoint = ConnectedEndpoint::connect(&controller_config(features), control_addr)
-        .await
-        .unwrap();
-    assert!(matches!(
-        event_rx.recv().await,
-        Some(EndpointEvent::Connected { .. })
-    ));
-    // keep the event channel open for the transport
-    tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
-
-    (ctrl_tx, endpoint)
 }
 
 fn release() -> Message {
@@ -149,6 +174,130 @@ async fn release_is_withheld_from_an_older_controller() {
     assert!(endpoint.release_rx.try_recv().is_err());
 }
 
+/// A release while the endpoint holds a format accept back (device not open
+/// yet): the transport answers the negotiation with `format_reject`
+/// (`released`) instead of leaving the controller to its timeout, and its
+/// `ReleaseHandled` event comes after the `FormatProposed`, so the
+/// application can tell the proposal was ended by the release.
+#[tokio::test]
+async fn release_during_a_deferred_accept_rejects_the_negotiation() {
+    let (ctrl_tx, mut endpoint, mut events) =
+        connect_with_events(vec![FEATURE_ENDPOINT_RELEASE.into()], true).await;
+    endpoint
+        .propose_format(
+            "s2",
+            AudioFormat::PcmS16le,
+            48000,
+            2,
+            ChannelLayout::Stereo,
+            16,
+        )
+        .await
+        .unwrap();
+    // the application sees the proposal, but releases before it accepts
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("no FormatProposed")
+            .expect("event channel closed");
+        if matches!(ev, EndpointEvent::FormatProposed(_)) {
+            break;
+        }
+    }
+    ctrl_tx.send(release()).await.unwrap();
+
+    let resp = tokio::time::timeout(Duration::from_secs(2), endpoint.response_rx.recv())
+        .await
+        .expect("negotiation not answered")
+        .expect("response channel closed");
+    match resp {
+        EndpointResponse::FormatReject(r) => {
+            assert_eq!(r.stream_id, "s2");
+            assert_eq!(r.reason, RELEASE_REJECT_REASON);
+        }
+        other => panic!("expected FormatReject, got {other:?}"),
+    }
+    tokio::time::timeout(Duration::from_secs(2), endpoint.release_rx.recv())
+        .await
+        .expect("no release from the endpoint")
+        .expect("release channel closed");
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("no ReleaseHandled")
+            .expect("event channel closed");
+        if matches!(ev, EndpointEvent::ReleaseHandled) {
+            break;
+        }
+    }
+    // no auto accept after the fail-open delay either
+    tokio::time::sleep(RELEASE_ACCEPT_TIMEOUT + Duration::from_millis(500)).await;
+    assert!(endpoint.response_rx.try_recv().is_err());
+}
+
+/// Without a negotiation in progress, a release rejects nothing.
+#[tokio::test]
+async fn release_without_a_negotiation_rejects_nothing() {
+    let (ctrl_tx, mut endpoint, mut events) =
+        connect_with_events(vec![FEATURE_ENDPOINT_RELEASE.into()], true).await;
+    ctrl_tx.send(release()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), endpoint.release_rx.recv())
+        .await
+        .expect("no release from the endpoint")
+        .expect("release channel closed");
+    let ev = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .expect("no ReleaseHandled")
+        .expect("event channel closed");
+    assert!(matches!(ev, EndpointEvent::ReleaseHandled), "got {ev:?}");
+    assert!(endpoint.response_rx.try_recv().is_err());
+}
+
+/// Time until the auto accept of a deferred accept the application never
+/// confirms.
+async fn fail_open_after(features: Vec<String>) -> Duration {
+    let (_ctrl_tx, mut endpoint, mut events) = connect_with_events(features, true).await;
+    tokio::spawn(async move { while events.recv().await.is_some() {} });
+    let t0 = std::time::Instant::now();
+    endpoint
+        .propose_format(
+            "s3",
+            AudioFormat::PcmS16le,
+            48000,
+            2,
+            ChannelLayout::Stereo,
+            16,
+        )
+        .await
+        .unwrap();
+    let resp = tokio::time::timeout(Duration::from_secs(5), endpoint.response_rx.recv())
+        .await
+        .expect("no auto accept")
+        .expect("response channel closed");
+    assert!(
+        matches!(resp, EndpointResponse::FormatAccept(_)),
+        "got {resp:?}"
+    );
+    t0.elapsed()
+}
+
+/// A controller that handles endpoint_release waits longer for an accept
+/// (§7.3.1), so the endpoint waits longer for its device before it fails
+/// open; an older controller gets the usual delay.
+#[tokio::test]
+async fn fail_open_is_longer_for_a_controller_that_handles_release() {
+    let older = fail_open_after(vec![]).await;
+    assert!(
+        older >= ACCEPT_TIMEOUT && older < RELEASE_ACCEPT_TIMEOUT,
+        "older controller: auto accept after {older:?}"
+    );
+    let aware = fail_open_after(vec![FEATURE_ENDPOINT_RELEASE.into()]).await;
+    assert!(
+        aware >= RELEASE_ACCEPT_TIMEOUT,
+        "release-aware controller: auto accept after {aware:?}"
+    );
+}
+
 /// In a zone, a release names the endpoint it came from, so the controller
 /// can drop that one endpoint and keep the others playing.
 #[tokio::test]
@@ -163,7 +312,7 @@ async fn zone_release_names_the_endpoint() {
 
     let mut ctrl_txs = Vec::new();
     for id in ["ep-a", "ep-b"] {
-        let (ctrl_tx, control_addr, mut event_rx) = spawn_endpoint(id).await;
+        let (ctrl_tx, control_addr, mut event_rx) = spawn_endpoint(id, false).await;
         tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
         assert_eq!(zone.add_endpoint(control_addr).await.unwrap(), id);
         ctrl_txs.push(ctrl_tx);
